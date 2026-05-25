@@ -1,22 +1,39 @@
 #!/usr/bin/env python3
 """
-Retrieves direct download links for Microsoft Store apps.
+Download packages directly from the Microsoft Store without a Windows machine.
 
-Queries Microsoft's ClientWebService and DisplayCatalog APIs to generate
-direct download URLs for .appx, .msix, .appxbundle, and .msixbundle files
-without relying on third-party services like store.rg-adguard.net.
+Flow:
+  1. Fetch product metadata from the Store Edge (storeedgefd) API to get the
+     Windows Update category ID and package family name for the app.
+  2. Call GetCookie on the WU ClientWebService SOAP endpoint to obtain a
+     session cookie that authorises subsequent WU calls.
+  3. Call SyncUpdates with the category ID to discover available update
+     identities (UpdateID + RevisionNumber) and their associated package
+     metadata (file name, architecture, SHA1/SHA256 digests).
+  4. Call GetExtendedUpdateInfo2 on the FE3 secured endpoint to exchange
+     each UpdateID/Revision pair for a time-limited CDN download URL.
+  5. Optionally download the resolved packages and/or extract them.
+
+Packages filtered out by default:
+  - Bundled framework/dependency packages (only the main app package is kept).
+  - Architectures that do not match the requested one (neutral is always kept).
+
 Inspired by https://github.com/1NobleCyber/Get-MSStoreDownloadLinks
 Itself sourced from https://github.com/MattiasC85/Scripts/blob/master/OSD
 
 Usage:
-    python get_msstore_download_links.py <ProductId> [--architecture {x86,x64,arm,arm64,neutral}]
-                                                     [--locale LOCALE]
-                                                     [--os-sku-id OS_SKU_ID]
-                                                     [--os-version OS_VERSION]
+    python ms-store-download.py <ProductId> [--architecture {x86,x64,arm,arm64,neutral,auto}]
+                                            [--all-packages]
+                                            [--locale LOCALE]
+                                            [--os-sku-id OS_SKU_ID]
+                                            [--os-version OS_VERSION]
+                                            [--download [DIR]]
+                                            [--extract [DIR]]
 
 Examples:
-    python get_msstore_download_links.py 9nbhcs1lx4r0 --architecture x64
-    python get_msstore_download_links.py 9ndh0f2vhzx2
+    python ms-store-download.py 9nbhcs1lx4r0 --architecture x64
+    python ms-store-download.py 9ndh0f2vhzx2 --download ~/Downloads
+    python ms-store-download.py 9ndh0f2vhzx2 --download /tmp/pkgs --extract
 """
 
 import argparse
@@ -51,10 +68,19 @@ _MACHINE_TO_ARCH = {
 }
 
 def _current_arch() -> str:
-    """Return the MS Store architecture name for the current machine."""
+    """Return the MS Store architecture name for the current machine.
+
+    :returns: One of ``"x64"``, ``"x86"``, ``"arm64"``, ``"arm"``,
+              defaulting to ``"x64"`` for unrecognised machine types.
+    :rtype: str
+    """
     return _MACHINE_TO_ARCH.get(platform.machine().lower(), "x64")
 
 
+# Windows Update catalog IDs that a typical Windows 10 Pro client reports as already
+# installed.  Sending these lists with SyncUpdates tells the WU service which updates
+# are already present on the "device", so it can determine the correct set of packages
+# to offer.  The exact values are taken from real WU traffic captures.
 INSTALLED_NON_LEAF_UPDATE_IDS = [
     1, 2, 3, 11, 19, 544, 549, 2359974, 2359977, 5169044, 8788830,
     23110993, 23110994, 54341900, 54343656, 59830006, 59830007, 59830008,
@@ -66,6 +92,9 @@ INSTALLED_NON_LEAF_UPDATE_IDS = [
     164847386, 164848327, 164852241, 164852246, 164852252, 164852253,
 ]
 
+# Additional cached update IDs (non-leaf updates that have been superseded but are
+# still tracked by the client).  Together with INSTALLED_NON_LEAF_UPDATE_IDS these
+# populate the SyncUpdates request so the WU service returns the correct update graph.
 OTHER_CACHED_UPDATE_IDS = [
     10, 17, 2359977, 5143990, 5169043, 5169047, 8806526, 9125350, 9154769,
     10809856, 23110995, 23110996, 23110999, 23111000, 23111001, 23111002,
@@ -172,15 +201,24 @@ class PackageInfo:
 
 
 def _wu_soap_envelope(headers: dict, body: str) -> str:
-    """Build a full SOAP envelope.
+    """Wrap *body* in a WS-Addressing / WS-Security SOAP envelope expected by the WU service.
 
-    headers dict keys:
-      action       -- WU action name, appended to the ClientWebService base URL
-      message_id   -- UUID string (without urn:uuid: prefix)
-      to_url       -- WS-Addressing To URL
-      created      -- WS-Security timestamp Created value
-      expires      -- WS-Security timestamp Expires value
-      ticket_token -- content of <TicketType>: "<User />" for GetCookie, release type otherwise
+    :param headers: Envelope metadata with the following keys:
+
+        * ``action`` — SOAP action name (e.g. ``"GetCookie"``, ``"SyncUpdates"``,
+          ``"GetExtendedUpdateInfo2"``).
+        * ``message_id`` — UUID string without the ``"urn:uuid:"`` prefix.
+        * ``to_url`` — WS-Addressing ``To`` URL (``client.asmx`` or
+          ``client.asmx/secured``).
+        * ``created`` — WS-Security timestamp ``Created`` value (ISO-8601 UTC).
+        * ``expires`` — WS-Security timestamp ``Expires`` value (ISO-8601 UTC).
+        * ``ticket_token`` — ``TicketType`` body: ``"<User />"`` for GetCookie,
+          ``"Retail"`` for all other calls.
+    :type headers: dict
+    :param body: XML fragment to embed inside the SOAP ``<s:Body>`` action element.
+    :type body: str
+    :returns: Complete SOAP envelope as a UTF-8 XML string.
+    :rtype: str
     """
     return f"""<s:Envelope xmlns:a="http://www.w3.org/2005/08/addressing" xmlns:s="http://www.w3.org/2003/05/soap-envelope">
     <s:Header>
@@ -210,6 +248,17 @@ def _wu_soap_envelope(headers: dict, body: str) -> str:
 
 
 def _soap_post(url: str, headers: dict, body: str) -> ET.Element:
+    """Send a SOAP request to *url* and return the parsed response root element.
+
+    :param url: SOAP endpoint URL.
+    :type url: str
+    :param headers: Envelope metadata passed to :func:`_wu_soap_envelope`.
+    :type headers: dict
+    :param body: XML body fragment for the SOAP action element.
+    :type body: str
+    :returns: Root element of the parsed XML response.
+    :rtype: xml.etree.ElementTree.Element
+    """
     envelope = _wu_soap_envelope(headers, body)
     data = envelope.encode("utf-8")
     http_headers = {"Content-Type": "application/soap+xml; charset=utf-8"}
@@ -220,19 +269,56 @@ def _soap_post(url: str, headers: dict, body: str) -> ET.Element:
 
 
 def _fmt(dt: datetime) -> str:
+    """Format *dt* as a WU-compatible UTC timestamp with millisecond precision.
+
+    :param dt: Timezone-naive UTC datetime.
+    :type dt: datetime.datetime
+    :returns: Timestamp string, e.g. ``"2024-01-15T10:30:00.123Z"``.
+    :rtype: str
+    """
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
 
 
 def _fmt7(dt: datetime) -> str:
+    """Format *dt* as a UTC timestamp with microsecond (7-digit) precision.
+
+    :param dt: Timezone-naive UTC datetime.
+    :type dt: datetime.datetime
+    :returns: Timestamp string, e.g. ``"2024-01-15T10:30:00.1234567Z"``.
+    :rtype: str
+    """
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond:07d}Z"
 
 
 def _build_int_list(ids: List[int], tag: str) -> str:
+    """Render a list of integers as a SOAP XML element containing ``<int>`` children.
+
+    :param ids: Integer values to serialise.
+    :type ids: list[int]
+    :param tag: Name of the wrapping XML element.
+    :type tag: str
+    :returns: Indented XML fragment string.
+    :rtype: str
+    """
     lines = [f"                    <int>{i}</int>" for i in ids]
     return f"                <{tag}>\n" + "\n".join(lines) + f"\n                </{tag}>"
 
 
 def _device_attributes(locale: str, os_sku_id: int, os_version: str) -> str:
+    """Build the ``DeviceAttributes`` string sent to the WU service.
+
+    The WU service uses these attributes to decide which packages are applicable
+    to the simulated Windows client (branch, SKU, OS version, architecture …).
+
+    :param locale: BCP-47 locale tag (e.g. ``"en-US"``).
+    :type locale: str
+    :param os_sku_id: Windows SKU ID (e.g. ``48`` for Windows 10 Pro).
+    :type os_sku_id: int
+    :param os_version: Windows version string (e.g. ``"10.0.19041.1"``).
+    :type os_version: str
+    :returns: Semicolon-separated key=value attribute string.
+    :rtype: str
+    """
     return (
         "BranchReadinessLevel=CB;CurrentBranch=rs_prerelease;OEMModel=Virtual Machine;"
         "FlightRing=WIS;AttrDataVer=21;SystemManufacturer=Microsoft Corporation;"
@@ -247,7 +333,17 @@ def _device_attributes(locale: str, os_sku_id: int, os_version: str) -> str:
 
 
 def _find_ancestor_id(doc: ET.Element, target: ET.Element, depth: int) -> Optional[str]:
-    """Find the <ID> text value that is `depth` levels above target in the tree."""
+    """Find the ``<ID>`` text value that is *depth* levels above *target* in the tree.
+
+    :param doc: Root of the full XML document (used to build the parent map).
+    :type doc: xml.etree.ElementTree.Element
+    :param target: Element to start walking upward from.
+    :type target: xml.etree.ElementTree.Element
+    :param depth: Number of levels to ascend before looking for an ``<ID>`` child.
+    :type depth: int
+    :returns: Text content of the ``<ID>`` element, or ``None`` if not found.
+    :rtype: str or None
+    """
     parent_map = {child: parent for parent in doc.iter() for child in parent}
     current = target
     for _ in range(depth):
@@ -263,10 +359,27 @@ def _find_ancestor_id(doc: ET.Element, target: ET.Element, depth: int) -> Option
 def _find_update_identity_for_secfrag(
     doc: ET.Element, sec_el: ET.Element
 ) -> Tuple[Optional[str], Optional[str]]:
-    """Find UpdateID and RevisionNumber from the UpdateIdentity sibling of a SecuredFragment.
+    """Return the ``(UpdateID, RevisionNumber)`` attributes paired with a ``SecuredFragment`` element.
 
-    Structure: SecuredFragment -> Properties -> Xml -> UpdateIdentity (attrs: UpdateID, RevisionNumber)
-    Go 2 levels up from SecuredFragment to reach the Xml element, then get its first child.
+    In the SyncUpdates XML response, each update entry has the structure::
+
+        <Xml>
+          <UpdateIdentity UpdateID="..." RevisionNumber="..." />
+          <Properties ...>
+            <SecuredFragment ... />   # sec_el points here
+          </Properties>
+        </Xml>
+
+    Walking two levels up from ``SecuredFragment`` reaches the ``Xml`` element
+    whose first child is the ``UpdateIdentity`` we need.
+
+    :param doc: Root of the full XML document (used to build the parent map).
+    :type doc: xml.etree.ElementTree.Element
+    :param sec_el: The ``SecuredFragment`` element to start from.
+    :type sec_el: xml.etree.ElementTree.Element
+    :returns: Tuple of ``(UpdateID, RevisionNumber)``, or ``(None, None)`` if
+              the structure does not match expectations.
+    :rtype: tuple[str or None, str or None]
     """
     parent_map = {child: parent for parent in doc.iter() for child in parent}
     current = sec_el
@@ -285,13 +398,30 @@ def _find_update_identity_for_secfrag(
     return update_id, revision
 
 def _bar_animation(percent):
-    """Simple terminal progress bar animation [=====     ]"""
+    """Return a fixed-width ASCII progress bar string, e.g. ``[=====     ] 50%``.
+
+    :param percent: Completion percentage (0–100).
+    :type percent: int
+    :returns: Progress bar string of fixed width.
+    :rtype: str
+    """
     bar_length = 30
     filled_length = int(bar_length * percent // 100)
     return f"[{'=' * filled_length}{' ' * (bar_length - filled_length)}] {percent}%"
 
 def _download_progress_callback(block_num: int, block_size: int, total_size: int) -> None:
-    """reporthook-style progress callback for file downloads."""
+    """Print a live download progress line to stdout.
+
+    Always prints on a TTY; on non-TTY output only prints at each 10 % milestone
+    to avoid flooding log files.
+
+    :param block_num: Number of blocks transferred so far.
+    :type block_num: int
+    :param block_size: Size of each block in bytes.
+    :type block_size: int
+    :param total_size: Total file size in bytes, or ``0`` if unknown.
+    :type total_size: int
+    """
     downloaded = block_num * block_size
     if total_size > 0:
         percent = min(100, int(downloaded * 100 / total_size))
@@ -310,7 +440,11 @@ def _download_progress_callback(block_num: int, block_size: int, total_size: int
 
 
 def _fetch_links_progress_callback(percent: int) -> None:
-    """Custom progress bar hook for get_download_links"""
+    """Print a live progress line while :func:`get_download_links` resolves CDN URLs.
+
+    :param percent: Completion percentage (0–100).
+    :type percent: int
+    """
     if percent < 100:
         print(f"\r-> Fetching download link: {_bar_animation(percent)}", end="", flush=True)
     else:
@@ -326,6 +460,44 @@ def get_download_links(
     main_only: bool = True,
     progress_callback: Optional[Callable[[int], None]] = _fetch_links_progress_callback
 ) -> List[Dict]:
+    """Resolve CDN download URLs for a Microsoft Store app.
+
+    Queries the Store Edge API to look up the Windows Update category for
+    *product_id*, then drives the WU SOAP protocol (GetCookie → SyncUpdates →
+    GetExtendedUpdateInfo2) to obtain time-limited CDN download URLs.
+
+    :param product_id: Microsoft Store product ID (e.g. ``"9ndh0f2vhzx2"``).
+    :type product_id: str
+    :param architecture: Keep only packages for this architecture.
+        Pass ``"auto"`` to use the current machine's architecture, or ``None``
+        to include all architectures.  ``"neutral"`` packages are always
+        included when a specific architecture is requested.
+    :type architecture: str or None
+    :param locale: BCP-47 locale tag sent as the simulated device locale in WU
+        requests (e.g. ``"en-US"``, ``"fr-FR"``).
+    :type locale: str
+    :param os_sku_id: Windows SKU ID reported to WU (``48`` = Windows 10 Pro).
+    :type os_sku_id: int
+    :param os_version: Windows version string reported to WU
+        (e.g. ``"10.0.19041.1"``).
+    :type os_version: str
+    :param main_only: If ``True``, return only the main app package (the one
+        whose name starts with the PackageFamilyName prefix), keeping the
+        latest version per architecture and discarding bundled dependency
+        packages.
+    :type main_only: bool
+    :param progress_callback: Called with an integer 0–100 as the request
+        progresses through its four stages.  Pass ``None`` to suppress
+        progress output.
+    :type progress_callback: callable or None
+    :returns: List of dicts, each with keys:
+
+        * ``"FileName"`` — local file name (e.g. ``"MyApp_1.2.3_x64.msix"``).
+        * ``"Architecture"`` — architecture string, or ``None`` for neutral packages.
+        * ``"Url"`` — time-limited CDN download URL.
+        * ``"Digest"`` — base64-encoded SHA256 of the package, or ``None``.
+    :rtype: list[dict]
+    """
     release_type = "Retail"
     client_ws_url = "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx"
     fe3_url = "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx/secured"
@@ -590,7 +762,15 @@ def get_download_links(
 
 
 def _verify_sha256(filepath: pathlib.Path, digest_b64: str) -> bool:
-    """Return True if the file's SHA256 matches the base64-encoded digest."""
+    """Return ``True`` if the file's SHA256 matches the base64-encoded digest.
+
+    :param filepath: Path to the file to verify.
+    :type filepath: pathlib.Path
+    :param digest_b64: Expected SHA256 digest, base64-encoded.
+    :type digest_b64: str
+    :returns: ``True`` if the digest matches, ``False`` otherwise.
+    :rtype: bool
+    """
     h = hashlib.sha256()
     with open(filepath, "rb") as f:
         for chunk in iter(lambda: f.read(65536), b""):
@@ -603,12 +783,25 @@ def download_packages(
     download_dir: pathlib.Path,
     extract_dir: Optional[pathlib.Path] = None,
 ) -> None:
-    """Download packages to *download_dir*, skipping files that already exist with a matching
-    SHA256 digest.  If *extract_dir* is given, each package is also extracted into a
-    subdirectory named after the package file stem (without extension).
+    """Download resolved packages to *download_dir*.
 
-    .msix / .appx / .msixbundle / .appxbundle files are ZIP archives and are extracted with
-    the standard :mod:`zipfile` module.
+    Each package is first written to a ``<name>.part`` temporary file and only
+    renamed to its final name after a successful SHA256 verification (when a
+    digest is available).  Files that are already present with a matching digest
+    are skipped without re-downloading.
+
+    If *extract_dir* is given, each downloaded ``.msix`` / ``.appx`` /
+    ``.msixbundle`` / ``.appxbundle`` file (all ZIP-based formats) is extracted
+    into a sub-directory of *extract_dir* named after the package stem.
+
+    :param packages: Package descriptors as returned by :func:`get_download_links`.
+    :type packages: list[dict]
+    :param download_dir: Directory where package files are saved.
+        Created automatically if it does not exist.
+    :type download_dir: pathlib.Path
+    :param extract_dir: Directory under which each package is extracted into its
+        own sub-directory.  ``None`` skips extraction.
+    :type extract_dir: pathlib.Path or None
     """
     download_dir.mkdir(parents=True, exist_ok=True)
 
@@ -671,29 +864,76 @@ def download_packages(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Retrieve direct download links for Microsoft Store apps."
+        description=(
+            "Fetch direct CDN download URLs for Microsoft Store app packages "
+            "(.msix/.appx/.msixbundle/.appxbundle) using the Windows Update SOAP API, "
+            "without requiring a Windows machine or third-party services."
+        )
     )
-    parser.add_argument("product_id", help="The Product ID of the Microsoft Store app")
+    parser.add_argument(
+        "product_id",
+        help=(
+            "Microsoft Store product ID for the app "
+            "(the 12-character code from the store URL, e.g. 9ndh0f2vhzx2)."
+        ),
+    )
     parser.add_argument(
         "--architecture",
         choices=["x86", "x64", "arm", "arm64", "neutral", "auto"],
-        help="Filter packages by architecture",
+        help=(
+            "Only return packages for this CPU architecture. "
+            '"auto" detects the current machine\'s architecture. '
+            "Neutral (architecture-independent) packages are always included "
+            "when a specific architecture is requested. "
+            "Omit to return packages for all architectures."
+        ),
     )
     parser.add_argument(
         "--all-packages",
         action="store_true",
-        help="Include bundled dependency packages, not just the main app package",
+        help=(
+            "Include bundled framework and dependency packages in addition to "
+            "the main app package. By default only the main package is returned."
+        ),
     )
-    parser.add_argument("--locale", default="en-US", help="Locale for device attributes (default: en-US)")
-    parser.add_argument("--os-sku-id", type=int, default=48, help="OS SKU ID (default: 48)")
-    parser.add_argument("--os-version", default="10.0.16184.1001", help="Windows OS version string (default: 10.0.16184.1001)")
+    parser.add_argument(
+        "--locale",
+        default="en-US",
+        help=(
+            "BCP-47 locale tag reported as the device locale in Windows Update "
+            "requests (default: en-US). Affects which language packs are offered."
+        ),
+    )
+    parser.add_argument(
+        "--os-sku-id",
+        type=int,
+        default=48,
+        help=(
+            "Windows SKU ID reported to the Windows Update service "
+            "(default: 48, which corresponds to Windows 10 Pro). "
+            "Change this if the app targets a different Windows edition."
+        ),
+    )
+    parser.add_argument(
+        "--os-version",
+        default="10.0.16184.1001",
+        help=(
+            "Windows version string reported to the Windows Update service "
+            "(default: 10.0.16184.1001). "
+            "Use a more recent build number if the app requires a newer OS."
+        ),
+    )
     parser.add_argument(
         "--download",
         nargs="?",
         const="",
         default=None,
         metavar="DIR",
-        help="Download packages. Optionally specify download directory (default: ~/Downloads)",
+        help=(
+            "Download the resolved packages to DIR. "
+            "If DIR is omitted, defaults to ~/Downloads. "
+            "Without this flag the script only prints the URLs."
+        ),
     )
     parser.add_argument(
         "--extract",
@@ -701,7 +941,12 @@ def main() -> None:
         const="",
         default=None,
         metavar="DIR",
-        help="Extract packages after downloading. Optionally specify extract directory (default: download directory)",
+        help=(
+            "Extract each downloaded package (ZIP-based .msix/.appx formats) into "
+            "a sub-directory of DIR named after the package. "
+            "If DIR is omitted, packages are extracted alongside the downloaded files. "
+            "Requires --download."
+        ),
     )
     args = parser.parse_args()
 
