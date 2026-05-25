@@ -20,20 +20,20 @@ https://www.microsoft.com/store/apps/9ndh0f2vhzx2
 ## Usage
 
 ```
-python ms-store-download.py <product_id> [options]
+python ms_store_download.py <product_id> [options]
 ```
 
 ### Print download URLs
 
 ```sh
 # All packages (all architectures)
-python ms-store-download.py 9ndh0f2vhzx2
+python ms_store_download.py 9ndh0f2vhzx2
 
 # Filter to x64 only
-python ms-store-download.py 9ndh0f2vhzx2 --architecture x64
+python ms_store_download.py 9ndh0f2vhzx2 --architecture x64
 
 # Detect current machine architecture automatically
-python ms-store-download.py 9ndh0f2vhzx2 --architecture auto
+python ms_store_download.py 9ndh0f2vhzx2 --architecture auto
 ```
 
 Output:
@@ -49,13 +49,13 @@ Digest:       abc123...== (SHA256)
 
 ```sh
 # Download to ~/Downloads (default)
-python ms-store-download.py 9ndh0f2vhzx2 --download
+python ms_store_download.py 9ndh0f2vhzx2 --download
 
 # Download to a specific directory
-python ms-store-download.py 9ndh0f2vhzx2 --download /tmp/myapp
+python ms_store_download.py 9ndh0f2vhzx2 --download /tmp/myapp
 
 # Download x64 package for the current machine
-python ms-store-download.py 9ndh0f2vhzx2 --architecture auto --download
+python ms_store_download.py 9ndh0f2vhzx2 --architecture auto --download
 ```
 
 Already-downloaded files are skipped if their SHA256 digest matches.
@@ -64,13 +64,13 @@ Already-downloaded files are skipped if their SHA256 digest matches.
 
 ```sh
 # Extract into the same directory as the downloaded files (each in its own sub-directory)
-python ms-store-download.py 9ndh0f2vhzx2 --download /tmp/myapp --extract
+python ms_store_download.py 9ndh0f2vhzx2 --download /tmp/myapp --extract
 
 # Extract into a separate directory (each in its own sub-directory)
-python ms-store-download.py 9ndh0f2vhzx2 --download /tmp/myapp --extract /tmp/myapp-extracted
+python ms_store_download.py 9ndh0f2vhzx2 --download /tmp/myapp --extract /tmp/myapp-extracted
 
 # Extract directly into the extract directory, without creating a sub-directory per package
-python ms-store-download.py 9ndh0f2vhzx2 --download /tmp/myapp --extract /tmp/myapp-extracted --extract-flat
+python ms_store_download.py 9ndh0f2vhzx2 --download /tmp/myapp --extract /tmp/myapp-extracted --extract-flat
 ```
 
 By default each package is extracted into its own sub-directory named after the package file stem (e.g. `/tmp/myapp-extracted/MyApp_1.2.3.0_x64/`). Use `--extract-flat` to extract files directly into the extract directory instead.
@@ -80,7 +80,7 @@ By default each package is extracted into its own sub-directory named after the 
 By default only the main app package is returned. Pass `--all-packages` to also include bundled framework and dependency packages:
 
 ```sh
-python ms-store-download.py 9ndh0f2vhzx2 --all-packages --download /tmp/myapp
+python ms_store_download.py 9ndh0f2vhzx2 --all-packages --download /tmp/myapp
 ```
 
 ## Options

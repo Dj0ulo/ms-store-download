@@ -22,7 +22,7 @@ Inspired by https://github.com/1NobleCyber/Get-MSStoreDownloadLinks
 Itself sourced from https://github.com/MattiasC85/Scripts/blob/master/OSD
 
 Usage:
-    python ms-store-download.py <ProductId> [--architecture {x86,x64,arm,arm64,neutral,auto}]
+    python ms_store_download.py <ProductId> [--architecture {x86,x64,arm,arm64,neutral,auto}]
                                             [--all-packages]
                                             [--locale LOCALE]
                                             [--os-sku-id OS_SKU_ID]
@@ -32,9 +32,9 @@ Usage:
                                             [--extract-flat]
 
 Examples:
-    python ms-store-download.py 9nbhcs1lx4r0 --architecture x64
-    python ms-store-download.py 9ndh0f2vhzx2 --download ~/Downloads
-    python ms-store-download.py 9ndh0f2vhzx2 --download /tmp/pkgs --extract
+    python ms_store_download.py 9nbhcs1lx4r0 --architecture x64
+    python ms_store_download.py 9ndh0f2vhzx2 --download ~/Downloads
+    python ms_store_download.py 9ndh0f2vhzx2 --download /tmp/pkgs --extract
 """
 
 import argparse
