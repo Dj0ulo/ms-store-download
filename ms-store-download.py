@@ -29,6 +29,7 @@ Usage:
                                             [--os-version OS_VERSION]
                                             [--download [DIR]]
                                             [--extract [DIR]]
+                                            [--extract-flat]
 
 Examples:
     python ms-store-download.py 9nbhcs1lx4r0 --architecture x64
@@ -782,6 +783,7 @@ def download_packages(
     packages: List[Dict],
     download_dir: pathlib.Path,
     extract_dir: Optional[pathlib.Path] = None,
+    extract_flat: bool = False,
 ) -> None:
     """Download resolved packages to *download_dir*.
 
@@ -792,16 +794,21 @@ def download_packages(
 
     If *extract_dir* is given, each downloaded ``.msix`` / ``.appx`` /
     ``.msixbundle`` / ``.appxbundle`` file (all ZIP-based formats) is extracted
-    into a sub-directory of *extract_dir* named after the package stem.
+    into *extract_dir*.  By default a sub-directory named after the package stem
+    is created inside *extract_dir*; pass *extract_flat=True* to extract
+    directly into *extract_dir* without creating that sub-directory.
 
     :param packages: Package descriptors as returned by :func:`get_download_links`.
     :type packages: list[dict]
     :param download_dir: Directory where package files are saved.
         Created automatically if it does not exist.
     :type download_dir: pathlib.Path
-    :param extract_dir: Directory under which each package is extracted into its
-        own sub-directory.  ``None`` skips extraction.
+    :param extract_dir: Directory into which packages are extracted.
+        ``None`` skips extraction.
     :type extract_dir: pathlib.Path or None
+    :param extract_flat: When ``True``, extract directly into *extract_dir*
+        instead of creating a per-package sub-directory.  Defaults to ``False``.
+    :type extract_flat: bool
     """
     download_dir.mkdir(parents=True, exist_ok=True)
 
@@ -850,7 +857,7 @@ def download_packages(
             part.replace(dest)
 
         if extract_dir is not None:
-            pkg_extract_dir = extract_dir / pathlib.Path(file_name).stem
+            pkg_extract_dir = extract_dir if extract_flat else extract_dir / pathlib.Path(file_name).stem
             pkg_extract_dir.mkdir(parents=True, exist_ok=True)
             print(f"  Extracting {file_name} -> {pkg_extract_dir}")
             try:
@@ -948,6 +955,15 @@ def main() -> None:
             "Requires --download."
         ),
     )
+    parser.add_argument(
+        "--extract-flat",
+        action="store_true",
+        help=(
+            "When extracting, put files directly into the extract directory instead of "
+            "creating a sub-directory named after the archive. "
+            "Only relevant when --extract is also given."
+        ),
+    )
     args = parser.parse_args()
 
     # Resolve --download / --extract paths
@@ -989,7 +1005,7 @@ def main() -> None:
 
     if download_dir is not None:
         print(f"Downloading to {download_dir} ...")
-        download_packages(results, download_dir, extract_dir)
+        download_packages(results, download_dir, extract_dir, extract_flat=args.extract_flat)
 
 
 if __name__ == "__main__":

@@ -63,14 +63,17 @@ Already-downloaded files are skipped if their SHA256 digest matches.
 ### Download and extract
 
 ```sh
-# Extract into the same directory as the downloaded files
+# Extract into the same directory as the downloaded files (each in its own sub-directory)
 python ms-store-download.py 9ndh0f2vhzx2 --download /tmp/myapp --extract
 
-# Extract into a separate directory
+# Extract into a separate directory (each in its own sub-directory)
 python ms-store-download.py 9ndh0f2vhzx2 --download /tmp/myapp --extract /tmp/myapp-extracted
+
+# Extract directly into the extract directory, without creating a sub-directory per package
+python ms-store-download.py 9ndh0f2vhzx2 --download /tmp/myapp --extract /tmp/myapp-extracted --extract-flat
 ```
 
-Each package is extracted into its own sub-directory named after the package file stem.
+By default each package is extracted into its own sub-directory named after the package file stem (e.g. `/tmp/myapp-extracted/MyApp_1.2.3.0_x64/`). Use `--extract-flat` to extract files directly into the extract directory instead.
 
 ### Include dependency packages
 
@@ -92,6 +95,7 @@ python ms-store-download.py 9ndh0f2vhzx2 --all-packages --download /tmp/myapp
 | `--os-version` | `10.0.16184.1001` | Windows version string reported to the WU service |
 | `--download [DIR]` | `~/Downloads` | Download packages to DIR |
 | `--extract [DIR]` | *(download dir)* | Extract downloaded packages to DIR (requires `--download`) |
+| `--extract-flat` | off | Extract files directly into the extract DIR instead of creating a sub-directory per package |
 
 ## Notes
 
