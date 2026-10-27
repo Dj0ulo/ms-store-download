@@ -122,6 +122,8 @@ import pathlib
 import ms_store_download as msd
 
 latest = msd.get_catalog_packages("9ndh0f2vhzx2", architecture="x64")   # fast version check
+# The newest version of one package: the catalog, or Windows Update if it can't answer
+newest = msd.get_latest_package("9ndh0f2vhzx2", "Publisher.App", architecture="x64")
 pkg = msd.get_download_links("9ndh0f2vhzx2", architecture="x64", progress_callback=None)[0]
 path = msd.download_package(pkg, pathlib.Path("/tmp/pkgs"), lambda done, total: ...)
 msd.extract_package(path, pathlib.Path("/tmp/app"), lambda done, total: ...)
@@ -130,6 +132,7 @@ msd.extract_package(path, pathlib.Path("/tmp/app"), lambda done, total: ...)
 - Every function raises `ms_store_download.StoreError` on failure instead of exiting.
 - `download_package` resumes a `.part` file left by an interrupted download, and keeps it if the progress callback raises (to cancel, for instance). A file whose SHA256 doesn't match is deleted.
 - `extract_package` checks for free disk space first.
+- `get_latest_package` returns `Version`, `Digest` and `Size`, plus a `Url` when the answer came from Windows Update (`Source == "soap"`). The catalog gives none: ask again with `source="soap"` to get one.
 - `ms_store_download.TIMEOUT` (default 30 s) bounds every network operation.
 
 ## Notes

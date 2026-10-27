@@ -42,8 +42,9 @@ Examples:
     python ms_store_download.py 9ndh0f2vhzx2 --catalog
 
 As a library: get_catalog_packages() checks for a new version in well under a
-second; get_download_links(), download_package() and extract_package() fetch
-it.  All of them raise StoreError rather than exit.
+second; get_latest_package() picks the newest version of one package, from the
+catalog or Windows Update; get_download_links(), download_package() and
+extract_package() fetch it.  All of them raise StoreError rather than exit.
 """
 
 import argparse
@@ -853,6 +854,90 @@ def get_catalog_packages(
                 "Size": int(pkg.get("MaxDownloadSizeInBytes") or 0),
             }
     return list(found.values())
+
+
+def _version_key(version: str) -> Tuple[int, ...]:
+    return tuple(int(x) for x in version.split("."))
+
+
+def get_latest_package(
+    product_id: str,
+    name: str,
+    architecture: Optional[str] = "auto",
+    source: str = "auto",
+    catalog_timeout: Optional[float] = None,
+) -> Dict:
+    """The newest version of package *name* the Store offers for an app.
+
+    Asks the Display Catalog (``source="catalog"``), Windows Update
+    (``source="soap"``), or the catalog first and Windows Update only if it
+    cannot answer (``source="auto"``).  The catalog is faster and its digest
+    comes over verified TLS, but it gives no download URL: when ``"Url"`` is
+    ``None``, call this again with ``source="soap"`` to get one, and check that
+    it offers the same version.
+
+    :param product_id: Microsoft Store product ID (e.g. ``"9ndh0f2vhzx2"``).
+    :type product_id: str
+    :param name: Package identity name, as in ``AppxManifest.xml``
+        (``<Identity Name="...">``).  A product's other packages are ignored.
+    :type name: str
+    :param architecture: As in :func:`get_download_links`.
+    :type architecture: str or None
+    :param source: ``"auto"``, ``"catalog"`` or ``"soap"``.
+    :type source: str
+    :param catalog_timeout: Seconds to wait for the catalog; defaults to :data:`TIMEOUT`.
+    :type catalog_timeout: float or None
+    :returns: Dict with keys ``"Name"``, ``"Version"`` (e.g. ``"1.2.3.0"``),
+        ``"Architecture"``, ``"Digest"`` (base64 SHA256, or ``None``), ``"Size"``
+        (bytes, ``0`` if unknown), ``"Url"`` and ``"FileName"`` (both ``None``
+        from the catalog), and ``"Source"`` (``"catalog"`` or ``"soap"``).
+    :rtype: dict
+    :raises StoreError: If no source asked could answer; the message holds each one's error.
+    """
+    if source not in ("auto", "catalog", "soap"):
+        raise ValueError(f"source must be auto, catalog or soap, not {source!r}")
+    if architecture == "auto":
+        architecture = _current_arch()
+    errors = []
+
+    if source in ("auto", "catalog"):
+        try:
+            best = None
+            for pkg in get_catalog_packages(product_id, architecture=architecture,
+                                            timeout=catalog_timeout):
+                if pkg["Name"] != name or not pkg["Digest"]:
+                    continue
+                if best is None or _version_key(pkg["Version"]) > _version_key(best["Version"]):
+                    best = pkg
+            if best is None:
+                raise StoreError(f"the catalog lists no {architecture or 'any'} package for {name}")
+            return {"Name": name, "Version": best["Version"], "Architecture": best["Architecture"],
+                    "Digest": best["Digest"], "Size": best["Size"], "Url": None,
+                    "FileName": None, "Source": "catalog"}
+        except StoreError as e:
+            errors.append(f"catalog: {e}")
+
+    if source in ("auto", "soap"):
+        try:
+            best = None
+            for link in get_download_links(product_id, architecture=architecture,
+                                           progress_callback=None):
+                # Name_Version_Architecture_...
+                parts = link["FileName"].split("_")
+                if parts[0] != name or len(parts) < 2 or not link.get("Url"):
+                    continue
+                if best is None or _version_key(parts[1]) > _version_key(best[1]):
+                    best = (link, parts[1])
+            if best is None:
+                raise StoreError(f"Windows Update offers no {architecture or 'any'} package for {name}")
+            link, version = best
+            return {"Name": name, "Version": version, "Architecture": link["Architecture"],
+                    "Digest": link.get("Digest"), "Size": 0, "Url": link["Url"],
+                    "FileName": link["FileName"], "Source": "soap"}
+        except StoreError as e:
+            errors.append(f"Windows Update: {e}")
+
+    raise StoreError("; ".join(errors))
 
 
 def verify_sha256(filepath: pathlib.Path, digest_b64: str) -> bool:
