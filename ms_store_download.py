@@ -14,6 +14,9 @@ Flow:
      each UpdateID/Revision pair for a time-limited CDN download URL.
   5. Optionally download the resolved packages and/or extract them.
 
+--catalog skips all of that and asks the Display Catalog API instead, which
+lists each package's version and SHA256 (but no URL) in a single request.
+
 Packages filtered out by default:
   - Bundled framework/dependency packages (only the main app package is kept).
   - Architectures that do not match the requested one (neutral is always kept).
@@ -30,11 +33,17 @@ Usage:
                                             [--download [DIR]]
                                             [--extract [DIR]]
                                             [--extract-flat]
+                                            [--catalog]
 
 Examples:
     python ms_store_download.py 9nbhcs1lx4r0 --architecture x64
     python ms_store_download.py 9ndh0f2vhzx2 --download ~/Downloads
     python ms_store_download.py 9ndh0f2vhzx2 --download /tmp/pkgs --extract
+    python ms_store_download.py 9ndh0f2vhzx2 --catalog
+
+As a library: get_catalog_packages() checks for a new version in well under a
+second; get_download_links(), download_package() and extract_package() fetch
+it.  All of them raise StoreError rather than exit.
 """
 
 import argparse
@@ -44,8 +53,10 @@ import json
 import pathlib
 import platform
 import random
+import shutil
 import sys
 import zipfile
+import zlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Dict, List, Optional, Tuple
@@ -55,7 +66,20 @@ import ssl
 import urllib.request
 import urllib.error
 
+# The WU endpoints chain to a Microsoft root that common Linux trust stores lack,
+# so they are reached unverified; check downloads against a digest instead.
 _SSL_CTX = ssl._create_unverified_context()
+
+# Seconds a network operation may block.  Library users may change it.
+TIMEOUT = 30
+
+DISPLAY_CATALOG_URL = (
+    "https://displaycatalog.mp.microsoft.com/v7.0/products/{}?market={}&languages=en-US"
+)
+
+
+class StoreError(Exception):
+    """Raised when the Store has no package to offer, or a download or extraction fails."""
 
 _MACHINE_TO_ARCH = {
     "x86_64": "x64",
@@ -264,9 +288,12 @@ def _soap_post(url: str, headers: dict, body: str) -> ET.Element:
     data = envelope.encode("utf-8")
     http_headers = {"Content-Type": "application/soap+xml; charset=utf-8"}
     req = urllib.request.Request(url, data=data, headers=http_headers, method="POST")
-    with urllib.request.urlopen(req, context=_SSL_CTX) as resp:
-        raw = resp.read()
-    return ET.fromstring(raw.decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, context=_SSL_CTX, timeout=TIMEOUT) as resp:
+            raw = resp.read()
+        return ET.fromstring(raw.decode("utf-8"))
+    except (OSError, ET.ParseError) as e:
+        raise StoreError(f"{headers['action']} request failed: {e}") from e
 
 
 def _fmt(dt: datetime) -> str:
@@ -410,20 +437,17 @@ def _bar_animation(percent):
     filled_length = int(bar_length * percent // 100)
     return f"[{'=' * filled_length}{' ' * (bar_length - filled_length)}] {percent}%"
 
-def _download_progress_callback(block_num: int, block_size: int, total_size: int) -> None:
+def _download_progress_callback(downloaded: int, total_size: int) -> None:
     """Print a live download progress line to stdout.
 
     Always prints on a TTY; on non-TTY output only prints at each 10 % milestone
     to avoid flooding log files.
 
-    :param block_num: Number of blocks transferred so far.
-    :type block_num: int
-    :param block_size: Size of each block in bytes.
-    :type block_size: int
+    :param downloaded: Bytes of the file on disk so far.
+    :type downloaded: int
     :param total_size: Total file size in bytes, or ``0`` if unknown.
     :type total_size: int
     """
-    downloaded = block_num * block_size
     if total_size > 0:
         percent = min(100, int(downloaded * 100 / total_size))
         downloaded_mb = downloaded / (1024 * 1024)
@@ -498,6 +522,7 @@ def get_download_links(
         * ``"Url"`` — time-limited CDN download URL.
         * ``"Digest"`` — base64-encoded SHA256 of the package, or ``None``.
     :rtype: list[dict]
+    :raises StoreError: If the Store cannot be reached or offers no package.
     """
     release_type = "Retail"
     client_ws_url = "https://fe3.delivery.mp.microsoft.com/ClientWebService/client.asmx"
@@ -511,11 +536,10 @@ def get_download_links(
     )
     req = urllib.request.Request(product_uri)
     try:
-        with urllib.request.urlopen(req, context=_SSL_CTX) as resp:
+        with urllib.request.urlopen(req, context=_SSL_CTX, timeout=TIMEOUT) as resp:
             prod_info = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.URLError as e:
-        print(f"Error: Failed to fetch product data from Store Edge API: {e}", file=sys.stderr)
-        sys.exit(1)
+    except (OSError, ValueError) as e:
+        raise StoreError(f"Failed to fetch product data from Store Edge API: {e}") from e
 
     if (prod_info.get("Payload", {}).get("DisplayPrice") or "").lower() not in ("free", "0.00", "0"):
         print(
@@ -526,17 +550,14 @@ def get_download_links(
 
     skus = prod_info.get("Payload", {}).get("Skus", [])
     if not skus:
-        print("Error: No SKUs found for this product.", file=sys.stderr)
-        sys.exit(1)
+        raise StoreError("No SKUs found for this product.")
 
     fulfillment_data_raw = skus[0].get("FulfillmentData")
     if not fulfillment_data_raw:
-        print(
-            "Warning: No fulfillment data found for this product. "
-            "It may be an .exe installer rather than an Appx/MSIX package.",
-            file=sys.stderr,
+        raise StoreError(
+            "No fulfillment data found for this product. "
+            "It may be an .exe installer rather than an Appx/MSIX package."
         )
-        sys.exit(0)
 
     data_obj = json.loads(fulfillment_data_raw)
     wu_category_id = str(data_obj["WuCategoryId"])
@@ -575,8 +596,7 @@ def get_download_links(
             encrypted_data_el = el
             break
     if encrypted_data_el is None or not encrypted_data_el.text:
-        print("Error: Could not retrieve cookie from ClientWebService.", file=sys.stderr)
-        sys.exit(1)
+        raise StoreError("Could not retrieve cookie from ClientWebService.")
     cookie_value = encrypted_data_el.text
 
     # --- Step 2: SyncUpdates ---
@@ -683,8 +703,7 @@ def get_download_links(
     packages = [p for p in packages if p.update_id is not None]
 
     if not packages:
-        print("Error: No updates found for this product.", file=sys.stderr)
-        sys.exit(1)
+        raise StoreError("No updates found for this product.")
 
     # Pre-filter before making FE3 requests — avoids one round-trip per excluded package
     if architecture:
@@ -762,7 +781,81 @@ def get_download_links(
     return final
 
 
-def _verify_sha256(filepath: pathlib.Path, digest_b64: str) -> bool:
+def get_catalog_packages(
+    product_id: str,
+    architecture: Optional[str] = "auto",
+    market: str = "US",
+    timeout: Optional[float] = None,
+) -> List[Dict]:
+    """List the packages the Store currently offers for an app, without download URLs.
+
+    Asks the Store's Display Catalog API, which answers in a fraction of a second
+    against several for :func:`get_download_links`, over TLS that verifies.  Use it to
+    see whether a newer version exists, and to check a download against its digest,
+    before paying for the Windows Update round-trips.
+
+    :param product_id: Microsoft Store product ID (e.g. ``"9ndh0f2vhzx2"``).
+    :type product_id: str
+    :param architecture: Keep only packages for this architecture, as in
+        :func:`get_download_links`.
+    :type architecture: str or None
+    :param market: Two-letter market code the catalog is asked for.
+    :type market: str
+    :param timeout: Seconds to wait for the catalog; defaults to :data:`TIMEOUT`.
+    :type timeout: float or None
+    :returns: List of dicts, each with keys:
+
+        * ``"PackageFullName"`` — e.g. ``"Publisher.App_1.2.3.0_x64__8wekyb3d8bbwe"``.
+          Not the ``"FileName"`` of :func:`get_download_links`, whose form varies.
+        * ``"Name"`` — package identity name.
+        * ``"Version"`` — package version (e.g. ``"1.2.3.0"``).
+        * ``"Architecture"`` — architecture string, or ``None`` for neutral packages.
+        * ``"Digest"`` — base64-encoded SHA256 of the package, or ``None``.
+        * ``"Format"`` — package format, lowercase (e.g. ``"msix"``, ``"appxbundle"``).
+        * ``"Size"`` — download size in bytes, or ``0`` if unknown.
+
+        A product may list several versions of a package.
+    :rtype: list[dict]
+    :raises StoreError: If the catalog cannot be reached or does not know the product.
+    """
+    if architecture == "auto":
+        architecture = _current_arch()
+    req = urllib.request.Request(
+        DISPLAY_CATALOG_URL.format(product_id, market), headers={"Accept": "application/json"}
+    )
+    try:
+        with urllib.request.urlopen(req, context=ssl.create_default_context(),
+                                    timeout=TIMEOUT if timeout is None else timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        availabilities = data["Product"]["DisplaySkuAvailabilities"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise StoreError(f"Failed to fetch product data from the Display Catalog API: {e}") from e
+
+    found: Dict[str, Dict] = {}
+    for avail in availabilities:
+        for pkg in (avail.get("Sku") or {}).get("Properties", {}).get("Packages") or []:
+            # Name_Version_Architecture_ResourceId_PublisherId
+            full_name = pkg.get("PackageFullName") or ""
+            parts = full_name.split("_")
+            if len(parts) < 5 or full_name in found:
+                continue
+            arch = None if parts[2] == "neutral" else parts[2]
+            if architecture and arch not in (architecture, None):
+                continue
+            digest = pkg.get("Hash") if (pkg.get("HashAlgorithm") or "").upper() == "SHA256" else None
+            found[full_name] = {
+                "PackageFullName": full_name,
+                "Name": parts[0],
+                "Version": parts[1],
+                "Architecture": arch,
+                "Digest": digest or None,
+                "Format": (pkg.get("PackageFormat") or "").lower(),
+                "Size": int(pkg.get("MaxDownloadSizeInBytes") or 0),
+            }
+    return list(found.values())
+
+
+def verify_sha256(filepath: pathlib.Path, digest_b64: str) -> bool:
     """Return ``True`` if the file's SHA256 matches the base64-encoded digest.
 
     :param filepath: Path to the file to verify.
@@ -774,9 +867,129 @@ def _verify_sha256(filepath: pathlib.Path, digest_b64: str) -> bool:
     """
     h = hashlib.sha256()
     with open(filepath, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
+        for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return base64.b64encode(h.digest()).decode() == digest_b64
+
+
+def download_package(
+    pkg: Dict,
+    download_dir: pathlib.Path,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> pathlib.Path:
+    """Download one package resolved by :func:`get_download_links` into *download_dir*.
+
+    The file is written to ``<name>.part`` and renamed to its final name only once
+    its SHA256 matches (when a digest is available).  A ``.part`` left by an
+    interrupted download is resumed rather than started over, and a file already
+    present with a matching digest is not downloaded again.
+
+    :param pkg: Package descriptor with at least ``"FileName"`` and ``"Url"``; its
+        ``"Digest"`` may be replaced by one from :func:`get_catalog_packages`.
+    :type pkg: dict
+    :param download_dir: Directory where the package is saved.  Created if missing.
+    :type download_dir: pathlib.Path
+    :param progress_callback: Called with ``(bytes_on_disk, total_bytes)`` as data
+        arrives; ``total_bytes`` is ``0`` if unknown.  An exception it raises stops
+        the download and propagates, keeping the ``.part`` file for a later resume.
+    :type progress_callback: callable or None
+    :returns: Path of the downloaded file.
+    :rtype: pathlib.Path
+    :raises StoreError: If the download fails or the digest does not match.  A
+        mismatching file is deleted; a partial one is kept.
+    """
+    download_dir.mkdir(parents=True, exist_ok=True)
+    dest = download_dir / pkg["FileName"]
+    part = dest.with_name(dest.name + ".part")
+    digest = pkg.get("Digest")
+
+    if dest.exists():
+        if digest and verify_sha256(dest, digest):
+            return dest
+        dest.unlink()
+
+    have = part.stat().st_size if part.exists() else 0
+    req = urllib.request.Request(pkg["Url"])
+    if have:
+        req.add_header("Range", f"bytes={have}-")
+    try:
+        resp = urllib.request.urlopen(req, context=_SSL_CTX, timeout=TIMEOUT)
+    except urllib.error.HTTPError as e:
+        if e.code != 416 or not have:
+            raise StoreError(f"Download failed for {dest.name}: {e}") from e
+        # Nothing left to fetch: the part is whole, or not this file at all.
+        if digest and verify_sha256(part, digest):
+            part.replace(dest)
+            return dest
+        part.unlink()
+        return download_package(pkg, download_dir, progress_callback)
+    except OSError as e:
+        raise StoreError(f"Download failed for {dest.name}: {e}") from e
+
+    h = hashlib.sha256()
+    with resp:
+        if have and resp.status == 206:
+            with open(part, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            mode = "ab"
+        else:
+            have, mode = 0, "wb"
+        total = have + int(resp.headers.get("Content-Length") or 0)
+        done = have
+        try:
+            with open(part, mode) as out:
+                progress_callback and progress_callback(done, total)
+                for chunk in iter(lambda: resp.read(1 << 20), b""):
+                    out.write(chunk)
+                    h.update(chunk)
+                    done += len(chunk)
+                    progress_callback and progress_callback(done, total)
+        except OSError as e:
+            raise StoreError(f"Download failed for {dest.name}: {e}") from e
+
+    if digest and base64.b64encode(h.digest()).decode() != digest:
+        part.unlink()
+        raise StoreError(f"Digest mismatch for {dest.name}; file deleted")
+    part.replace(dest)
+    return dest
+
+
+def extract_package(
+    package: pathlib.Path,
+    extract_dir: pathlib.Path,
+    progress_callback: Optional[Callable[[int, int], None]] = None,
+) -> None:
+    """Extract a ZIP-based package (``.msix``, ``.appx``, and their bundles) into *extract_dir*.
+
+    :param package: Path of the package file.
+    :type package: pathlib.Path
+    :param extract_dir: Directory the files are written into.  Created if missing.
+    :type extract_dir: pathlib.Path
+    :param progress_callback: Called with ``(bytes_extracted, total_bytes)`` after
+        each file.  An exception it raises stops the extraction and propagates.
+    :type progress_callback: callable or None
+    :raises StoreError: If the package is not a valid archive, the disk lacks the
+        space for its contents, or writing fails.
+    """
+    try:
+        with zipfile.ZipFile(package) as zf:
+            members = zf.infolist()
+            total = sum(m.file_size for m in members)
+            extract_dir.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(extract_dir).free
+            if free < total:
+                raise StoreError(
+                    f"Not enough disk space to extract {package.name}: "
+                    f"{total / 1e9:.1f} GB needed, {free / 1e9:.1f} GB free in {extract_dir}"
+                )
+            done = 0
+            for m in members:
+                zf.extract(m, extract_dir)
+                done += m.file_size
+                progress_callback and progress_callback(done, total)
+    except (OSError, zipfile.BadZipFile, zlib.error) as e:
+        raise StoreError(f"Could not extract {package.name}: {e}") from e
 
 
 def download_packages(
@@ -784,13 +997,11 @@ def download_packages(
     download_dir: pathlib.Path,
     extract_dir: Optional[pathlib.Path] = None,
     extract_flat: bool = False,
-) -> None:
-    """Download resolved packages to *download_dir*.
+) -> List[pathlib.Path]:
+    """Download resolved packages to *download_dir*, printing progress.
 
-    Each package is first written to a ``<name>.part`` temporary file and only
-    renamed to its final name after a successful SHA256 verification (when a
-    digest is available).  Files that are already present with a matching digest
-    are skipped without re-downloading.
+    Each package goes through :func:`download_package`, so a file already present
+    with a matching digest is skipped and an interrupted download is resumed.
 
     If *extract_dir* is given, each downloaded ``.msix`` / ``.appx`` /
     ``.msixbundle`` / ``.appxbundle`` file (all ZIP-based formats) is extracted
@@ -809,64 +1020,44 @@ def download_packages(
     :param extract_flat: When ``True``, extract directly into *extract_dir*
         instead of creating a per-package sub-directory.  Defaults to ``False``.
     :type extract_flat: bool
+    :returns: Paths of the downloaded files.
+    :rtype: list[pathlib.Path]
+    :raises StoreError: After trying every package, if any failed.
     """
-    download_dir.mkdir(parents=True, exist_ok=True)
-
+    downloaded: List[pathlib.Path] = []
+    failed: List[str] = []
     for pkg in packages:
         file_name = pkg["FileName"]
-        url = pkg["Url"]
-        digest = pkg.get("Digest")  # SHA256 base64, may be None
+        if not pkg.get("Digest"):
+            print(f"  Warning: no SHA256 digest available for {file_name} — cannot verify integrity", file=sys.stderr)
         dest = download_dir / file_name
-        part = dest.with_suffix(dest.suffix + ".part")
-
-        if dest.exists() and digest and _verify_sha256(dest, digest):
+        if pkg.get("Digest") and dest.exists() and verify_sha256(dest, pkg["Digest"]):
             print(f"  Skip  {file_name} (cached, digest OK)")
         else:
-            if not digest:
-                print(f"  Warning: no SHA256 digest available for {file_name} — cannot verify integrity", file=sys.stderr)
-
             print(f"  Downloading {file_name} ...")
+            _download_progress_callback.last_printed = -1
             try:
-                req = urllib.request.Request(url)
-                with urllib.request.urlopen(req, context=_SSL_CTX) as resp:
-                    total = int(resp.headers.get("Content-Length") or 0)
-                    downloaded = 0
-                    with open(part, "wb") as out:
-                        block_num = 0
-                        block_size = 65536
-                        while True:
-                            chunk = resp.read(block_size)
-                            if not chunk:
-                                break
-                            out.write(chunk)
-                            downloaded += len(chunk)
-                            block_num += 1
-                            _download_progress_callback(block_num, block_size, total)
-                _download_progress_callback(max(1, downloaded // 65536), 65536, downloaded)
-                print()
-            except Exception as exc:
-                part.unlink(missing_ok=True)
-                print(f"  Error: download failed for {file_name}: {exc}", file=sys.stderr)
+                dest = download_package(pkg, download_dir, _download_progress_callback)
+            except StoreError as exc:
+                print(f"\n  Error: {exc}", file=sys.stderr)
+                failed.append(file_name)
                 continue
-
-            if digest and not _verify_sha256(part, digest):
-                part.unlink(missing_ok=True)
-                print(f"  Error: digest mismatch for {file_name} — file deleted", file=sys.stderr)
-                continue
-
-            part.replace(dest)
+            print()
+        downloaded.append(dest)
 
         if extract_dir is not None:
-            pkg_extract_dir = extract_dir if extract_flat else extract_dir / pathlib.Path(file_name).stem
-            pkg_extract_dir.mkdir(parents=True, exist_ok=True)
+            pkg_extract_dir = extract_dir if extract_flat else extract_dir / dest.stem
             print(f"  Extracting {file_name} -> {pkg_extract_dir}")
             try:
-                with zipfile.ZipFile(dest, "r") as zf:
-                    zf.extractall(pkg_extract_dir)
+                extract_package(dest, pkg_extract_dir)
                 print(f"    Done ({len(list(pkg_extract_dir.iterdir()))} items)")
-            except zipfile.BadZipFile as exc:
-                print(f"  Error: could not extract {file_name}: {exc}", file=sys.stderr)
+            except StoreError as exc:
+                print(f"  Error: {exc}", file=sys.stderr)
+                failed.append(file_name)
 
+    if failed:
+        raise StoreError(f"{len(failed)} of {len(packages)} package(s) failed: {', '.join(failed)}")
+    return downloaded
 
 
 def main() -> None:
@@ -964,6 +1155,14 @@ def main() -> None:
             "Only relevant when --extract is also given."
         ),
     )
+    parser.add_argument(
+        "--catalog",
+        action="store_true",
+        help=(
+            "Only list the packages the Store offers (version, size, SHA256), from the "
+            "Display Catalog API. Much faster than resolving download URLs, but gives none."
+        ),
+    )
     args = parser.parse_args()
 
     # Resolve --download / --extract paths
@@ -980,32 +1179,50 @@ def main() -> None:
         raw = args.extract
         extract_dir = (pathlib.Path(raw) if raw else download_dir).expanduser().resolve()
 
-    results = get_download_links(
-        product_id=args.product_id,
-        architecture=_current_arch() if args.architecture == "auto" else args.architecture,
-        locale=args.locale,
-        os_sku_id=args.os_sku_id,
-        os_version=args.os_version,
-        main_only=not args.all_packages,
-        progress_callback=_fetch_links_progress_callback
-    )
-
-    if not results:
-        print("No download links found.", file=sys.stderr)
+    if args.catalog and download_dir is not None:
+        print("Error: --catalog gives no download URL; drop --download", file=sys.stderr)
         sys.exit(1)
 
-    if download_dir is None:
-        for pkg in results:
-            print(f"FileName:     {pkg['FileName']}")
-            print(f"Architecture: {pkg['Architecture']}")
-            print(f"Url:          {pkg['Url']}")
-            if pkg.get("Digest"):
-                print(f"Digest:       {pkg['Digest']} (SHA256)")
-            print()
+    architecture = _current_arch() if args.architecture == "auto" else args.architecture
+    try:
+        if args.catalog:
+            results = get_catalog_packages(args.product_id, architecture=architecture)
+        else:
+            results = get_download_links(
+                product_id=args.product_id,
+                architecture=architecture,
+                locale=args.locale,
+                os_sku_id=args.os_sku_id,
+                os_version=args.os_version,
+                main_only=not args.all_packages,
+                progress_callback=_fetch_links_progress_callback
+            )
 
-    if download_dir is not None:
-        print(f"Downloading to {download_dir} ...")
-        download_packages(results, download_dir, extract_dir, extract_flat=args.extract_flat)
+        if not results:
+            print("No packages found." if args.catalog else "No download links found.", file=sys.stderr)
+            sys.exit(1)
+
+        if download_dir is None:
+            for pkg in results:
+                if args.catalog:
+                    print(f"Package:      {pkg['PackageFullName']}")
+                    print(f"Architecture: {pkg['Architecture']}")
+                    print(f"Version:      {pkg['Version']}")
+                    print(f"Format:       {pkg['Format']}")
+                    print(f"Size:         {pkg['Size']}")
+                else:
+                    print(f"FileName:     {pkg['FileName']}")
+                    print(f"Architecture: {pkg['Architecture']}")
+                    print(f"Url:          {pkg['Url']}")
+                if pkg.get("Digest"):
+                    print(f"Digest:       {pkg['Digest']} (SHA256)")
+                print()
+        else:
+            print(f"Downloading to {download_dir} ...")
+            download_packages(results, download_dir, extract_dir, extract_flat=args.extract_flat)
+    except StoreError as e:
+        print(f"\nError: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
